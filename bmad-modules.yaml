@@ -35,7 +35,7 @@
 
 modules:
   bmad-builder:
-    url: https://github.com/bmad-code-org/bmad-builder
+    url: https://github.com/BMC-team/bmad-builder
     module-definition: skills/module.yaml
     code: bmb
     name: "BMad Builder"
@@ -46,7 +46,7 @@ modules:
     default_channel: stable
 
   bmad-creative-intelligence-suite:
-    url: https://github.com/bmad-code-org/bmad-module-creative-intelligence-suite
+    url: https://github.com/BMC-team/bmad-module-creative-intelligence-suite
     module-definition: src/module.yaml
     code: cis
     name: "BMad Creative Intelligence Suite"
@@ -57,7 +57,7 @@ modules:
     default_channel: stable
 
   bmad-method-test-architecture-enterprise:
-    url: https://github.com/bmad-code-org/bmad-method-test-architecture-enterprise
+    url: https://github.com/BMC-team/bmad-method-test-architecture-enterprise
     module-definition: src/module.yaml
     code: tea
     name: "BMad Test Architect"
