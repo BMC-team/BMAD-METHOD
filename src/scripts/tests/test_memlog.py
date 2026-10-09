@@ -9,8 +9,10 @@ one line recorded at the end in the order it happened — no sections, no groupi
 lifecycle status the log would have to mutate.
 """
 import json
+import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -26,6 +28,20 @@ MEMLOG = ".memlog.md"
 @pytest.fixture
 def ws(tmp_path):
     return str(tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def private_temp_dir(tmp_path_factory, monkeypatch):
+    """Every test's temp-dir lock files land in a pytest-managed dir, never in the shared /tmp.
+
+    A workspace outside git takes the temp fallback, and a lock file is never removed (that
+    is how flock works), so without this each run would leave ~30 files in
+    /tmp/bmad-memlog-locks. TMPDIR reaches the child processes; tempfile.tempdir this one.
+    """
+    temp = tmp_path_factory.mktemp("memlog-temp")  # a sibling of tmp_path, outside the workspace
+    monkeypatch.setenv("TMPDIR", str(temp))
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    return temp
 
 
 def read(ws):
@@ -425,6 +441,56 @@ def test_set_waits_for_the_same_lock(ws, capsys, monkeypatch):
         fcntl.flock(held.fileno(), fcntl.LOCK_EX)
         assert memlog.main(["set", "--workspace", ws, "--key", "goal", "--value", "v2"]) == memlog.EXIT_LOCKED
     assert memlog.split(read(ws))[0]["goal"] == "ideas for a pitch"
+
+
+def test_lock_timeout_exits_75_and_writes_nothing(ws, monkeypatch):
+    fcntl = pytest.importorskip("fcntl")
+    init(ws)
+    monkeypatch.setattr(memlog, "LOCK_WAIT_S", 0.1)
+    lock = memlog.lock_path(Path(ws) / MEMLOG)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "a") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        rc = memlog.main(["append", "--workspace", ws, "--text", "late"])
+        waited = time.monotonic() - started
+    assert rc == 75  # EX_TEMPFAIL, promised by --help: the literal, not the constant
+    assert 0.1 <= waited < 5
+    assert entries(ws) == []
+
+
+def test_unwritable_git_dir_falls_back_to_the_temp_dir(tmp_path, private_temp_dir):
+    pytest.importorskip("fcntl")
+    if os.geteuid() == 0:
+        pytest.skip("root writes through a 0o555 directory")
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    run = repo / "ledger" / "run-1"
+    run.mkdir(parents=True)
+    (repo / ".git").chmod(0o555)
+    try:
+        init(str(run))
+        append(str(run), "still lands")
+    finally:
+        (repo / ".git").chmod(0o755)
+    assert entries(str(run)) == ["- still lands"]
+    assert not (repo / ".git" / memlog.LOCK_DIR).exists()  # the git dir was never written
+    temp_lock = memlog.temp_lock_path(run / MEMLOG)
+    assert temp_lock.exists()
+    assert private_temp_dir.resolve() in temp_lock.resolve().parents
+
+
+def test_dot_git_file_naming_a_missing_gitdir_falls_back_like_no_git(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: ../gone/.git/worktrees/wt\n", encoding="utf-8")
+    run = wt / "run"
+    lock = memlog.lock_path(run / MEMLOG)
+    assert lock == memlog.temp_lock_path(run / MEMLOG)  # as if the work tree had no git at all
+    init(str(run))
+    append(str(run), "x")
+    assert entries(str(run)) == ["- x"]
+    assert not (tmp_path / "gone").exists()  # no stray tree created where the dangling gitdir points
 
 
 def test_help_documents_the_lock_and_that_append_does_not_commit(capsys):
