@@ -42,7 +42,10 @@ the work tree, so it can never be staged into a shared git index: for a memlog i
 a git work tree it is `<git dir>/bmad-memlog-locks/<name>.lock`, keyed by the memlog's
 path inside the work tree (the same lock for every process that sees the clone, whatever
 its environment or mount point); outside git, or when the git dir is not writable, it is
-`<temp dir>/bmad-memlog-locks/<name>.lock`, keyed by the memlog's absolute path. A writer
+`<temp dir>/bmad-memlog-locks/<name>.lock`, keyed by the memlog's absolute path (the temp
+dir is `tempfile.gettempdir()`, i.e. $TMPDIR else /tmp, so two fallback writers with a
+different TMPDIR do not exclude each other - the known split; the git-dir lock has none).
+A dangling `.git` file (its gitdir gone) counts as no git. A writer
 waits up to 10 s for the lock, then refuses with exit code 75 and a JSON line
 `{"ok": false, "error": "locked", ..., "entry": "<the line>"}` - nothing was written, and
 the caller re-runs the same command. Platforms without `fcntl` (Windows) write unlocked.
@@ -178,7 +181,11 @@ def fsync_dir(directory: Path) -> None:
 
 
 def git_dir(top: Path) -> Path | None:
-    """The git dir of a work tree top: `.git` itself, or where a linked worktree's `.git` file points."""
+    """The git dir of a work tree top: `.git` itself, or where a linked worktree's `.git` file points.
+
+    A `.git` file naming a gitdir that does not exist (a pruned or moved worktree) counts as
+    no git at all: the lock must never `mkdir -p` a stray tree where that dangling path points.
+    """
     dot = top / ".git"
     try:
         if dot.is_dir():
@@ -186,7 +193,8 @@ def git_dir(top: Path) -> Path | None:
         if dot.is_file():
             first = dot.read_text(encoding="utf-8").strip()
             if first.startswith("gitdir:"):
-                return (top / first[len("gitdir:"):].strip()).resolve()
+                gd = (top / first[len("gitdir:"):].strip()).resolve()
+                return gd if gd.is_dir() else None
     except OSError:
         return None
     return None
@@ -197,6 +205,12 @@ def lock_name(memlog_dir: str, key: str) -> str:
 
 
 def temp_lock_path(path: Path) -> Path:
+    """The fallback lock: `tempfile.gettempdir()` (TMPDIR, else /tmp; computed once per process).
+
+    The known split: two writers outside git (or with an unwritable git dir) whose TMPDIR
+    differs take two different locks. The git-dir lock, the path every seat's memlog takes,
+    does not depend on the environment.
+    """
     target = path.resolve()
     return Path(tempfile.gettempdir()) / LOCK_DIR / lock_name(target.parent.name, str(target))
 
@@ -354,10 +368,12 @@ APPEND_HELP = """append one entry at the end of the memlog, then print one JSON 
 {"ok": true, "memlog": "<file>", "entries": <count>}.
 
 Lock: the read, the append and the write run under an exclusive fcntl.flock on
-<git dir>/bmad-memlog-locks/<name>.lock (outside git: <temp dir>/bmad-memlog-locks/),
-never in the work tree. Another writer holding it is waited for up to 10 s; then the
-command refuses with exit code 75 and {"ok": false, "error": "locked", ..., "entry":
-"<the line>"} - nothing was written; re-run the same command.
+<git dir>/bmad-memlog-locks/<name>.lock (outside git, or with an unwritable git dir:
+<temp dir>/bmad-memlog-locks/, the temp dir being $TMPDIR else /tmp - writers with a
+different TMPDIR take different fallback locks), never in the work tree. Another
+writer holding it is waited for up to 10 s; then the command refuses with exit code
+75 and {"ok": false, "error": "locked", ..., "entry": "<the line>"} - nothing was
+written; re-run the same command.
 
 F-MEMLOG-NOCOMMIT: append does NOT commit, stage or push. A memlog kept in git is the
 caller's to git add + commit + push after each entry.
