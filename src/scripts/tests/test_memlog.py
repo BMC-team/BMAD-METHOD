@@ -9,7 +9,10 @@ one line recorded at the end in the order it happened — no sections, no groupi
 lifecycle status the log would have to mutate.
 """
 import json
+import subprocess
 import sys
+import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -304,3 +307,130 @@ def test_ack_entry_count_climbs(ws, capsys):
     append(ws, "b")
     out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert out["entries"] == 2
+
+
+# --- concurrency: one writer at a time (F-MEMLOG-RACE) --------------------
+
+SCRIPTS = Path(__file__).resolve().parent.parent
+
+# Each child reports ready, waits for the shared start flag, then appends its 10 lines as fast as it can,
+# so the two read-modify-write cycles overlap the way two agents sharing one run folder do.
+CHILD = textwrap.dedent(
+    """
+    import os, sys, time
+    sys.path.insert(0, sys.argv[1])
+    import memlog
+    ws, who, go = sys.argv[2], sys.argv[3], sys.argv[4]
+    open(go + "." + who, "w").close()  # ready: imported and waiting
+    while not os.path.exists(go):
+        time.sleep(0.001)
+    for i in range(10):
+        rc = memlog.main(["append", "--workspace", ws, "--by", who,
+                          "--text", f"{who} line {i:02d} " + "x" * 400])
+        if rc != 0:
+            sys.exit(rc)
+    """
+)
+
+
+def test_two_processes_appending_concurrently_keep_all_20_lines(ws, tmp_path):
+    init(ws)
+    go = tmp_path / "go"
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", CHILD, str(SCRIPTS), ws, who, str(go)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for who in ("alpha", "beta")
+    ]
+    deadline = time.monotonic() + 30
+    while not all((tmp_path / f"go.{who}").exists() for who in ("alpha", "beta")):
+        assert time.monotonic() < deadline, "children never became ready"
+        time.sleep(0.005)
+    go.write_text("go")
+    results = [p.communicate(timeout=60) + (p.returncode,) for p in procs]
+    for _out, err, rc in results:
+        assert rc == 0, err[-2000:]
+    want = {f"- (by {who}) {who} line {i:02d} " + "x" * 400 for who in ("alpha", "beta") for i in range(10)}
+    got = entries(ws)
+    assert len(got) == 20, f"{len(got)} entries, lost or cut lines"
+    assert set(got) == want  # every line intact: none cut, none merged, none lost
+    for who in ("alpha", "beta"):  # each writer's own lines stay in the order it wrote them
+        mine = [ln for ln in got if ln.startswith(f"- (by {who}) ")]
+        assert mine == sorted(mine)
+    assert not list(Path(ws).glob("*.tmp"))  # no stray temp file left behind
+
+
+def test_lock_file_never_lands_in_the_work_tree(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    run = repo / "ledger" / "run-1"
+    init(str(run))
+    append(str(run), "x")
+    lock = memlog.lock_path(run / MEMLOG)
+    assert (repo / ".git") in lock.parents  # inside the git dir: git never indexes it
+    tracked = sorted(str(p.relative_to(repo)) for p in repo.rglob("*") if p.is_file() and ".git" not in p.parts)
+    assert tracked == [str(Path("ledger") / "run-1" / MEMLOG)]
+
+
+def test_lock_follows_a_linked_worktree_gitdir(tmp_path):
+    gitdir = tmp_path / "main" / ".git" / "worktrees" / "wt"
+    gitdir.mkdir(parents=True)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: ../main/.git/worktrees/wt\n", encoding="utf-8")
+    lock = memlog.lock_path(wt / "run" / MEMLOG)
+    assert gitdir.resolve() in lock.parents
+
+
+def test_lock_key_is_the_memlog_path_inside_the_work_tree(tmp_path):
+    for top in ("a", "b"):  # the same clone seen under two mount points shares one lock name
+        (tmp_path / top / ".git").mkdir(parents=True)
+    la = memlog.lock_path(tmp_path / "a" / "run" / MEMLOG)
+    lb = memlog.lock_path(tmp_path / "b" / "run" / MEMLOG)
+    assert la.name == lb.name
+    assert la != memlog.lock_path(tmp_path / "a" / "other" / MEMLOG)
+
+
+def test_lock_outside_git_stays_out_of_the_workspace(ws):
+    lock = memlog.lock_path(Path(ws) / MEMLOG)
+    assert Path(ws).resolve() not in lock.resolve().parents
+
+
+def test_append_refuses_after_the_bounded_wait_and_prints_the_line(ws, capsys, monkeypatch):
+    fcntl = pytest.importorskip("fcntl")
+    init(ws)
+    capsys.readouterr()
+    monkeypatch.setattr(memlog, "LOCK_WAIT_S", 0.3)
+    lock = memlog.lock_path(Path(ws) / MEMLOG)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "a") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        rc = memlog.main(["append", "--workspace", ws, "--type", "step", "--by", "me", "--text", "keep me"])
+    assert rc == memlog.EXIT_LOCKED
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["ok"] is False
+    assert out["error"] == "locked"
+    assert out["entry"] == "- (step by me) keep me"  # the caller re-runs the same append
+    assert entries(ws) == []  # nothing written while another writer held the lock
+
+
+def test_set_waits_for_the_same_lock(ws, capsys, monkeypatch):
+    fcntl = pytest.importorskip("fcntl")
+    init(ws)
+    monkeypatch.setattr(memlog, "LOCK_WAIT_S", 0.3)
+    lock = memlog.lock_path(Path(ws) / MEMLOG)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "a") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        assert memlog.main(["set", "--workspace", ws, "--key", "goal", "--value", "v2"]) == memlog.EXIT_LOCKED
+    assert memlog.split(read(ws))[0]["goal"] == "ideas for a pitch"
+
+
+def test_help_documents_the_lock_and_that_append_does_not_commit(capsys):
+    with pytest.raises(SystemExit):
+        memlog.main(["append", "--help"])
+    out = " ".join(capsys.readouterr().out.split())
+    assert "lock" in out
+    assert "10 s" in out
+    assert "F-MEMLOG-NOCOMMIT" in out
