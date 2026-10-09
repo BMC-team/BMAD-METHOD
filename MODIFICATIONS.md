@@ -19,3 +19,24 @@ Applied-Here: bmc-v6.11.0 @ 4d2d7ea0991d8eb9fb18650e8dd61d2e40b31678; row
  carried on bmc-main for future syncs
 Reviewed-by: owner plan D-015 (2026-08-19); C4 executed
 Last-Update: 2026-08-19
+
+## Row 2
+Description: memlog.py serializes writers. Every command (init, append, set)
+ holds an exclusive fcntl.flock for its whole read-modify-write, so concurrent
+ appends to one memlog neither cut nor lose a line (F-MEMLOG-RACE: the shared
+ .memlog.md.tmp raced to FileNotFoundError and lost lines). The lock file lives
+ in the git dir of the memlog's work tree (else the temp dir), never in the
+ work tree, so no shared index is polluted. A 10 s bounded wait, then exit 75
+ and a JSON refusal carrying the entry for the caller to retry. The rename is
+ followed by a directory fsync. --help documents the lock and
+ F-MEMLOG-NOCOMMIT (append never commits).
+Paths: src/scripts/memlog.py, src/scripts/tests/test_memlog.py
+Origin: BMC-team (build-memlog-lock-1, seat-1002073908-5063; gap P8)
+Bug: F-MEMLOG-RACE (BMC-v5-system-administrator
+ docs/records/2026-10-09-beads-lane-findings.md section 3.5)
+Forwarded: no (candidate for upstream after the owner's review)
+Applied-Upstream: no
+Applied-Here: not yet (bmc-main PR; the install branch bmc-v6.11.0 and the
+ seat image's npm bmad-method@6.11.0 install are a separate owner step)
+Reviewed-by: pending (the lane's reviewer; the owner merges)
+Last-Update: 2026-10-09

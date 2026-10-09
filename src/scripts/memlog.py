@@ -32,7 +32,23 @@ Three invariants make it trustworthy:
      everything else.
 
 Atomicity: every write goes to a temp file, is flushed and fsync'd, then atomically
-renamed over the target, so a crash never leaves a half-written entry.
+renamed over the target (and the directory fsync'd), so a crash never leaves a
+half-written entry.
+
+Concurrency (one writer at a time): every command holds an exclusive `fcntl.flock`
+on a lock file for its whole read-modify-write, so two agents appending to one memlog
+at the same moment can neither cut a line nor lose one. The lock file never sits in
+the work tree, so it can never be staged into a shared git index: for a memlog inside
+a git work tree it is `<git dir>/bmad-memlog-locks/<name>.lock`, keyed by the memlog's
+path inside the work tree (the same lock for every process that sees the clone, whatever
+its environment or mount point); outside git, or when the git dir is not writable, it is
+`<temp dir>/bmad-memlog-locks/<name>.lock`, keyed by the memlog's absolute path. A writer
+waits up to 10 s for the lock, then refuses with exit code 75 and a JSON line
+`{"ok": false, "error": "locked", ..., "entry": "<the line>"}` - nothing was written, and
+the caller re-runs the same command. Platforms without `fcntl` (Windows) write unlocked.
+
+Committing (F-MEMLOG-NOCOMMIT): no command commits, stages or pushes anything. A memlog
+kept in git is the caller's to `git add` + commit + push after each entry.
 
 The file shape (.memlog.md):
 
@@ -69,13 +85,27 @@ Addressing: `--workspace` is the run folder, and the memlog is always {workspace
 from __future__ import annotations  # keep type-hint syntax lazy so the script runs on 3.8+
 
 import argparse
+import hashlib
 import json
 import os
 import sys
+import tempfile
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # Windows: no flock, so writes there stay unserialized
+    fcntl = None  # type: ignore[assignment]
+
 MEMLOG = ".memlog.md"
+LOCK_DIR = "bmad-memlog-locks"
+LOCK_WAIT_S = 10.0  # bounded wait for another writer, then refuse (EXIT_LOCKED)
+LOCK_POLL_S = 0.02
+EXIT_LOCKED = 75  # EX_TEMPFAIL: busy, nothing written, re-run the same command
 
 
 def now() -> str:
@@ -120,13 +150,131 @@ def touch(meta: dict) -> None:
 
 
 def write_atomic(path: Path, text: str) -> None:
-    """Temp + flush + fsync + atomic rename, so a crash never half-writes an entry."""
+    """Temp + flush + fsync + atomic rename, so a crash never half-writes an entry.
+
+    Callers hold `locked(path)`, so the fixed temp name is never shared by two writers.
+    """
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    fsync_dir(path.parent)
+
+
+def fsync_dir(directory: Path) -> None:
+    """Make the rename itself durable; a no-op where a directory cannot be opened."""
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def git_dir(top: Path) -> Path | None:
+    """The git dir of a work tree top: `.git` itself, or where a linked worktree's `.git` file points."""
+    dot = top / ".git"
+    try:
+        if dot.is_dir():
+            return dot
+        if dot.is_file():
+            first = dot.read_text(encoding="utf-8").strip()
+            if first.startswith("gitdir:"):
+                return (top / first[len("gitdir:"):].strip()).resolve()
+    except OSError:
+        return None
+    return None
+
+
+def lock_name(memlog_dir: str, key: str) -> str:
+    return f"{memlog_dir or 'root'}-{hashlib.sha256(key.encode('utf-8')).hexdigest()[:24]}.lock"
+
+
+def temp_lock_path(path: Path) -> Path:
+    target = path.resolve()
+    return Path(tempfile.gettempdir()) / LOCK_DIR / lock_name(target.parent.name, str(target))
+
+
+def lock_path(path: Path) -> Path:
+    """Where the memlog's lock lives: in the git dir of its work tree, else in the temp dir.
+
+    Never next to the memlog: a lock file in the work tree would be staged into the
+    shared index by the next `git add -A`.
+    """
+    target = path.resolve()
+    for top in target.parents:
+        gd = git_dir(top)
+        if gd is not None:
+            key = target.relative_to(top).as_posix()
+            return gd / LOCK_DIR / lock_name(target.parent.name, key)
+    return temp_lock_path(path)
+
+
+class Locked(Exception):
+    """Another writer held the memlog's lock for the whole bounded wait."""
+
+    def __init__(self, lock: Path) -> None:
+        super().__init__(str(lock))
+        self.lock = lock
+
+
+def open_lock(path: Path) -> tuple[int, Path]:
+    for lock in (lock_path(path), temp_lock_path(path)):
+        try:
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            return os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o666), lock
+        except OSError:
+            continue  # an unwritable git dir: fall back to the temp dir
+    raise OSError(f"cannot create a lock file for {path}")
+
+
+@contextmanager
+def locked(path: Path) -> Iterator[Path | None]:
+    """Hold the memlog's exclusive lock for one read-modify-write; wait LOCK_WAIT_S, then raise Locked."""
+    if fcntl is None:
+        yield None
+        return
+    fd, lock = open_lock(path)
+    try:
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise Locked(lock) from None
+                time.sleep(LOCK_POLL_S)
+        try:
+            yield lock
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def refuse(path: Path, lock: Path, **retry: str) -> int:
+    """The bounded wait ran out: nothing was written; echo what to re-run so no line is lost."""
+    print(json.dumps({
+        "ok": False,
+        "error": "locked",
+        "memlog": str(path),
+        "lock": str(lock),
+        "waited_s": LOCK_WAIT_S,
+        **retry,
+    }))
+    print(
+        f"error: {path} stayed locked by another writer for {LOCK_WAIT_S:g} s ({lock}); "
+        "nothing was written - re-run the same command",
+        file=sys.stderr,
+    )
+    return EXIT_LOCKED
 
 
 def entry_count(body: str) -> int:
@@ -155,36 +303,65 @@ def cmd_init(args) -> int:
             return 2
         k, v = pair.split("=", 1)
         meta[k.strip()] = v.strip()
-    touch(meta)
-    write_atomic(path, render(meta, ""))
+    try:
+        with locked(path):
+            if path.exists():  # another writer created it while this one waited
+                print(f"error: {path} already exists; use append/set to update it", file=sys.stderr)
+                return 2
+            touch(meta)
+            write_atomic(path, render(meta, ""))
+    except Locked as e:
+        return refuse(path, e.lock)
     ack(path, "")
     return 0
 
 
 def cmd_append(args) -> int:
     path = resolve(args)
-    meta, body = split(path.read_text(encoding="utf-8"))
     text = " ".join(args.text.split())  # collapse newlines/runs → one-line entry, no prose bloat
     label = args.type or ""
     if args.by:
         label = f"{label} by {args.by}".strip()  # attribution: "(idea by user)" / "(by coach)"
     tag = f"({label}) " if label else ""
     entry = f"- {tag}{text}"
-    body = (body.rstrip("\n") + "\n" + entry) if body.strip() else entry  # always at the end
-    touch(meta)
-    write_atomic(path, render(meta, body))
+    try:
+        with locked(path):  # the read, the append and the write are one step for other writers
+            meta, body = split(path.read_text(encoding="utf-8"))
+            body = (body.rstrip("\n") + "\n" + entry) if body.strip() else entry  # always at the end
+            touch(meta)
+            write_atomic(path, render(meta, body))
+    except Locked as e:
+        return refuse(path, e.lock, entry=entry)
     ack(path, body)
     return 0
 
 
 def cmd_set(args) -> int:
     path = resolve(args)
-    meta, body = split(path.read_text(encoding="utf-8"))
-    meta[args.key] = args.value
-    touch(meta)
-    write_atomic(path, render(meta, body))
+    try:
+        with locked(path):
+            meta, body = split(path.read_text(encoding="utf-8"))
+            meta[args.key] = args.value
+            touch(meta)
+            write_atomic(path, render(meta, body))
+    except Locked as e:
+        return refuse(path, e.lock, key=args.key, value=args.value)
     ack(path, body)
     return 0
+
+
+APPEND_HELP = """append one entry at the end of the memlog, then print one JSON line:
+{"ok": true, "memlog": "<file>", "entries": <count>}.
+
+Lock: the read, the append and the write run under an exclusive fcntl.flock on
+<git dir>/bmad-memlog-locks/<name>.lock (outside git: <temp dir>/bmad-memlog-locks/),
+never in the work tree. Another writer holding it is waited for up to 10 s; then the
+command refuses with exit code 75 and {"ok": false, "error": "locked", ..., "entry":
+"<the line>"} - nothing was written; re-run the same command.
+
+F-MEMLOG-NOCOMMIT: append does NOT commit, stage or push. A memlog kept in git is the
+caller's to git add + commit + push after each entry.
+"""
 
 
 def add_target(sp) -> None:
@@ -203,7 +380,12 @@ def main(argv: list[str] | None = None) -> int:
     pi.add_argument("--field", action="append", metavar="KEY=VALUE", help="frontmatter field (repeatable)")
     pi.set_defaults(func=cmd_init)
 
-    pa = sub.add_parser("append", help="append one entry at the end")
+    pa = sub.add_parser(
+        "append",
+        help="append one entry at the end",
+        description=APPEND_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_target(pa)
     pa.add_argument("--text", required=True)
     pa.add_argument("--type", help="entry kind, rendered as an inline tag")
